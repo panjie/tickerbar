@@ -1,6 +1,7 @@
 pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Layouts
+import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Commons as Commons
@@ -96,6 +97,89 @@ Panel {
   onConfigPathChanged: startRun(buildCmd())
 
   readonly property var groups: snapshot && snapshot.groups ? snapshot.groups : []
+
+  // ---- Detail card state. Clicking a table row opens that asset. The KEY
+  //      (label|symbol) is stored, not the row object, so the card follows
+  //      every refresh in place — and closes itself when the asset leaves the
+  //      watchlist.
+  property string selectedKey: ""
+
+  function rowKey(r) {
+    if (!r) return ""
+    var sym = (r.symbol === undefined || r.symbol === null) ? "" : String(r.symbol)
+    return String(r.label) + "\u001f" + sym
+  }
+
+  function findSelectedRow() {
+    if (selectedKey === "") return null
+    for (var i = 0; i < groups.length; i++) {
+      var rows = groups[i].rows || []
+      for (var j = 0; j < rows.length; j++)
+        if (root.rowKey(rows[j]) === root.selectedKey) return rows[j]
+    }
+    return null
+  }
+
+  function findSelectedGroup() {
+    if (selectedKey === "") return null
+    for (var i = 0; i < groups.length; i++) {
+      var rows = groups[i].rows || []
+      for (var j = 0; j < rows.length; j++)
+        if (root.rowKey(rows[j]) === root.selectedKey) return groups[i]
+    }
+    return null
+  }
+
+  readonly property var selectedRow: findSelectedRow()
+  readonly property var selectedGroup: findSelectedGroup()
+
+  function showDetail(r) {
+    root.selectedKey = root.rowKey(r)
+  }
+
+  function clearDetail() {
+    root.selectedKey = ""
+  }
+
+  // Copy-the-symbol affordance (same two-state check the install button uses).
+  property bool symbolCopied: false
+  Timer {
+    id: symbolCopiedReset
+    interval: 1500
+    onTriggered: root.symbolCopied = false
+  }
+
+  // ---- Detail card values. Everything is derived from the row the table
+  //      already holds, so opening the card costs no extra request.
+  readonly property string detailSymbol: selectedRow
+    ? ((selectedRow.symbol === undefined || selectedRow.symbol === null) ? "" : String(selectedRow.symbol)) : ""
+  readonly property string detailGlyph: selectedRow ? String(selectedRow.glyph || "") : ""
+  readonly property string detailSource: (selectedGroup && selectedGroup.sources)
+    ? selectedGroup.sources.join("·") : ""
+  readonly property string detailPriceText: selectedRow ? priceText(selectedRow) : ""
+  readonly property string detailCurrency: (selectedRow && selectedRow.unit === "currency" && selectedRow.quote)
+    ? " " + String(selectedRow.quote).toUpperCase() : ""
+  readonly property string detailChangeText: {
+    var r = root.selectedRow
+    if (!r) return ""
+    var t = chgCellText(r)
+    return t !== "" ? t : "—"
+  }
+  readonly property color detailDirColor: root.panelDirColor(selectedRow ? selectedRow.direction : null)
+  readonly property real detailRangePos: selectedRow ? rangePosition(selectedRow) : -1
+  readonly property string detailMeta: {
+    var r = root.selectedRow
+    if (!r) return ""
+    var parts = []
+    if (detailSymbol !== "") parts.push(detailSymbol)
+    if (detailSource !== "") parts.push(detailSource)
+    var m = marketLabel(r)
+    if (m !== "") parts.push(m)
+    var s = stateLabel(r)
+    if (s !== "") parts.push(s)
+    return parts.join(" · ")
+  }
+
   // A failed plugin run counts as stale even when the cached snapshot still
   // says "ok" — the prices on screen are the last good ones either way.
   readonly property string lifecycle: pluginStale
@@ -146,6 +230,354 @@ Panel {
     if (r.unit === "percent")
       return Number(r.day_low).toFixed(2) + "%–" + Number(r.day_high).toFixed(2) + "%"
     return fmtNumber(r.day_low) + "–" + fmtNumber(r.day_high)
+  }
+
+  // ---- Detail-card derivations. The payload carries the price, the day's
+  //      percent move and the day's low/high — nothing else — so the previous
+  //      close and the absolute change are IMPLIED from the percent instead of
+  //      being fetched from a second source and printed as if it were fact.
+  function prevClose(r) {
+    if (!r || r.price === null || r.price === undefined) return null
+    if (r.change_pct === null || r.change_pct === undefined) return null
+    var pct = Number(r.change_pct)
+    if (!isFinite(pct) || pct <= -100) return null
+    return Number(r.price) / (1 + pct / 100)
+  }
+
+  function prevText(r) {
+    var prev = prevClose(r)
+    if (prev === null) return ""
+    if (r.unit === "percent") return prev.toFixed(2) + "%"
+    return fmtNumber(prev) + root.detailCurrency
+  }
+
+  function amountText(r) {
+    var prev = prevClose(r)
+    if (prev === null) return "—"
+    var d = Number(r.price) - prev
+    var sign = d > 0 ? "+" : (d < 0 ? "−" : " ")
+    var body = r.unit === "percent" ? Math.abs(d).toFixed(2) + "pp" : fmtNumber(Math.abs(d))
+    return sign + body
+  }
+
+  // (high - low) over the previous close: the session's amplitude.
+  function amplitudeText(r) {
+    var prev = prevClose(r)
+    if (prev === null || prev === 0) return ""
+    if (r.day_low === null || r.day_low === undefined) return ""
+    if (r.day_high === null || r.day_high === undefined) return ""
+    return Math.abs((Number(r.day_high) - Number(r.day_low)) / prev * 100).toFixed(2) + "%"
+  }
+
+  // Where the price sits inside the day's range: 0 = at the low, 1 = at the
+  // high, -1 = no usable range (no session data yet).
+  function rangePosition(r) {
+    if (!r) return -1
+    if (r.day_low === null || r.day_low === undefined) return -1
+    if (r.day_high === null || r.day_high === undefined) return -1
+    var lo = Number(r.day_low)
+    var hi = Number(r.day_high)
+    if (!(hi > lo)) return -1
+    var p = (Number(r.price) - lo) / (hi - lo)
+    if (!isFinite(p)) return -1
+    return Math.max(0, Math.min(1, p))
+  }
+
+  function marketLabel(r) {
+    if (!r) return ""
+    if (r.market === "closed") return "closed"
+    if (r.market === "open") return "open"
+    return ""
+  }
+
+  function stateLabel(r) {
+    if (!r) return ""
+    var s = (r.state === undefined || r.state === null) ? "" : String(r.state)
+    if (s === "stale") return "stale (cached)"
+    if (s === "missing") return "no data"
+    return s
+  }
+
+  // ---- Fundamentals from the detail feed. Absent fields drop their row
+  //      instead of printing a dash, so an index shows the session facts it
+  //      has and nothing that pretends a cap exists.
+  function quoteValue(key, digits) {
+    var q = root.detailQuote
+    if (!q) return ""
+    var v = q[key]
+    if (v === null || v === undefined || v === "") return ""
+    var n = Number(v)
+    if (!isFinite(n)) return ""
+    return digits === undefined ? String(v) : n.toFixed(digits)
+  }
+
+  readonly property string detailRangeText: {
+    var q = root.detailQuote
+    if (!q || q.yrLow === null || q.yrLow === undefined || q.yrHigh === null || q.yrHigh === undefined)
+      return ""
+    return fmtNumber(q.yrLow) + "–" + fmtNumber(q.yrHigh)
+  }
+
+  readonly property string detailMarketCapText: {
+    var q = root.detailQuote
+    if (!q || !q.marketCap) return ""
+    return (q.currency ? String(q.currency) + " " : "") + String(q.marketCap)
+  }
+
+  // The card's key/value block, in reading order: what it costs, what moved,
+  // where the move started, how wide the day was, then the provenance. The
+  // right column carries fundamentals and only exists when the feed returned
+  // any, so an index does not print a column of dashes.
+  readonly property var detailRows: {
+    var r = root.selectedRow
+    if (!r) return []
+    var rows = []
+    var chg = root.detailChangeText
+    rows.push({ label: "Price", value: root.detailPriceText + root.detailCurrency, dir: null, strong: true })
+    rows.push({ label: "Day change", value: root.amountText(r) + (chg !== "—" ? "  (" + chg + ")" : ""), dir: r.direction, strong: false })
+    var prev = root.prevText(r)
+    rows.push({ label: "Prev close", value: prev !== "" ? prev : "—", dir: null, strong: false })
+    var open = root.quoteValue("open")
+    if (open !== "") rows.push({ label: "Open", value: fmtNumber(Number(open)) + root.detailCurrency, dir: null, strong: false })
+    var range = root.rangeText(r)
+    rows.push({ label: "Day range", value: range !== "" ? range + root.detailCurrency : "—", dir: null, strong: false })
+    if (root.detailRangeText !== "") rows.push({ label: "52w range", value: root.detailRangeText, dir: null, strong: false })
+    var amp = root.amplitudeText(r)
+    rows.push({ label: "Amplitude", value: amp !== "" ? amp : "—", dir: null, strong: false })
+    var market = root.marketLabel(r)
+    rows.push({ label: "Market", value: market !== "" ? market : "—", dir: null, strong: false })
+    rows.push({ label: "Data", value: root.stateLabel(r) + (root.detailSource !== "" ? " · " + root.detailSource : ""), dir: null, strong: false })
+    return rows
+  }
+
+  readonly property var detailRowsRight: {
+    var q = root.detailQuote
+    if (!q) return []
+    var rows = []
+    var pe = root.quoteValue("pe", 2)
+    if (pe !== "") rows.push({ label: "P/E", value: pe, dir: null, strong: false })
+    var eps = root.quoteValue("eps", 2)
+    if (eps !== "") rows.push({ label: "EPS", value: eps, dir: null, strong: false })
+    if (q.volume !== null && q.volume !== undefined)
+      rows.push({ label: "Volume", value: root.compactNumber(q.volume), dir: null, strong: false })
+    if (q.avgVolume) rows.push({ label: "10d avg vol", value: String(q.avgVolume), dir: null, strong: false })
+    var beta = root.quoteValue("beta", 2)
+    if (beta !== "") rows.push({ label: "Beta", value: beta, dir: null, strong: false })
+    if (q.divYield) rows.push({ label: "Div yield", value: String(q.divYield), dir: null, strong: false })
+    if (q.sharesOut) rows.push({ label: "Shares out", value: String(q.sharesOut), dir: null, strong: false })
+    if (q.exchange) rows.push({ label: "Exchange", value: String(q.exchange), dir: null, strong: false })
+    if (q.name) rows.push({ label: "Name", value: String(q.name), dir: null, strong: false })
+    return rows
+  }
+
+  // The quote page: CNBC (which backs stocks, indices, commodities and rates)
+  // takes the exact symbol the payload carries, so `.SSEC` or `6702-JP` land
+  // on the right page. Anything else falls back to a web search for the label,
+  // so the button is never a dead end.
+  function quoteUrl() {
+    var r = root.selectedRow
+    if (!r) return ""
+    if (root.detailSymbol !== "" && root.detailSource.indexOf("cnbc") >= 0)
+      return "https://www.cnbc.com/quotes/" + encodeURIComponent(root.detailSymbol)
+    return "https://www.google.com/search?q="
+      + encodeURIComponent(String(r.label) + " " + root.detailSymbol)
+  }
+
+  function openQuote() {
+    var url = root.quoteUrl()
+    if (url !== "") Util.execArgv(["omarchy-launch-browser", url])
+  }
+
+  function copySymbol() {
+    if (root.detailSymbol === "") return
+    Util.execArgv(["wl-copy", root.detailSymbol])
+    root.symbolCopied = true
+    symbolCopiedReset.restart()
+  }
+
+  // ---- Detail feed: market cap, P/E, 52-week range and OHLC candles. The
+  //      panel's own JSON carries none of that, so a companion script runs
+  //      for the SELECTED symbol only — same CNBC provider and the same symbol
+  //      vocabulary as the prices above, two requests per run. All of it is
+  //      optional: when the feed fails the card still shows what the table
+  //      already had, plus one quiet line saying why.
+  property var detailFeed: null
+  property string detailRange: "1D"      // 1D | 1W | 1Y
+  property string detailFeedError: ""
+  property bool detailFeedBusy: false
+  property string detailFeedSymbol: ""   // the symbol detailFeed belongs to
+  property double detailFeedAt: 0
+  property var detailCache: ({})         // symbol -> { doc, at }
+  property string detailRequestSymbol: ""
+  property bool detailRequestQueued: false
+  property bool detailCollectorDone: true
+  property bool detailProcessDone: true
+  property string detailCaptured: ""
+  property int detailExitCode: 0
+
+  readonly property string detailScript: {
+    var override = String(setting("detailScript", "")).trim()
+    if (override !== "") return override
+    var base = Quickshell.env("XDG_CONFIG_HOME") || (Quickshell.env("HOME") + "/.config")
+    return base + "/omarchy/plugins/mryll.tickerbar/scripts/quote_detail.py"
+  }
+
+  // Only CNBC-backed rows share the feed's symbol vocabulary. A row from
+  // another provider (a CoinGecko id, an ARS house) would get a chart of some
+  // OTHER instrument with the same letters, so it gets no feed at all.
+  readonly property bool detailFeedSupported: detailSource.indexOf("cnbc") >= 0
+
+  readonly property var detailQuote: (detailFeed && detailFeed.quote
+    && detailFeedSymbol === detailSymbol) ? detailFeed.quote : null
+
+  readonly property var detailCandles: {
+    if (!detailFeed || !detailFeed.ranges || detailFeedSymbol !== detailSymbol) return []
+    var range = detailFeed.ranges[root.detailRange]
+    return (range && range.candles) ? range.candles : []
+  }
+
+  // Min/max of the visible series, shared by the canvas and the two scale
+  // labels so they cannot disagree.
+  readonly property var detailBounds: {
+    var data = detailCandles
+    var hi = -Infinity
+    var lo = Infinity
+    for (var i = 0; i < data.length; i++) {
+      if (Number(data[i].h) > hi) hi = Number(data[i].h)
+      if (Number(data[i].l) < lo) lo = Number(data[i].l)
+    }
+    return { hi: hi, lo: lo }
+  }
+
+  readonly property bool detailLoadingHere: detailFeedBusy && detailRequestSymbol === detailSymbol
+
+  readonly property string detailChartStatus: {
+    if (detailLoadingHere) return "Loading…"
+    if (detailFeedError !== "") return detailFeedError
+    if (detailFeed && detailCandles.length === 0) return "no candles for this range"
+    return ""
+  }
+
+  function compactNumber(v) {
+    if (v === null || v === undefined) return "—"
+    var n = Number(v)
+    if (!isFinite(n)) return "—"
+    var a = Math.abs(n)
+    if (a >= 1e12) return (n / 1e12).toFixed(2) + "T"
+    if (a >= 1e9) return (n / 1e9).toFixed(2) + "B"
+    if (a >= 1e6) return (n / 1e6).toFixed(2) + "M"
+    if (a >= 1e3) return (n / 1e3).toFixed(1) + "K"
+    return String(Math.round(n))
+  }
+
+  function requestDetail(force) {
+    var sym = root.detailSymbol
+    if (sym === "") return
+    if (!root.detailFeedSupported) return
+    var cached = root.detailCache[sym]
+    var now = Date.now()
+    if (!force && cached && (now - cached.at) < 55000) {
+      root.applyDetail(sym, cached.doc, cached.at)
+      return
+    }
+    if (root.detailFeedBusy) { root.detailRequestQueued = true; return }
+    root.startDetailRun(sym)
+  }
+
+  function startDetailRun(sym) {
+    root.detailRequestSymbol = sym
+    root.detailFeedBusy = true
+    root.detailCollectorDone = false
+    root.detailProcessDone = false
+    root.detailCaptured = ""
+    root.detailExitCode = 0
+    // Through sh, never direct: a missing script must not abort the shell
+    // inside a failed process start (see startRun above).
+    detailProc.command = ["/bin/sh", "-c", 'exec timeout 25 "$0" "$@"', root.detailScript, "--symbol", sym]
+    detailProc.running = true
+  }
+
+  function applyDetail(sym, doc, at) {
+    if (root.detailSymbol !== sym) return
+    root.detailFeed = doc
+    root.detailFeedSymbol = sym
+    root.detailFeedAt = at
+    root.detailFeedError = (doc && doc.error) ? String(doc.error) : ""
+  }
+
+  function maybeApplyDetail() {
+    if (!root.detailCollectorDone || !root.detailProcessDone) return
+    root.detailFeedBusy = false
+    var sym = root.detailRequestSymbol
+    var doc = null
+    try { doc = JSON.parse(root.detailCaptured) } catch (e) { doc = null }
+    if (doc && doc.schema === 1) {
+      var now = Date.now()
+      root.detailCache[sym] = { doc: doc, at: now }
+      root.applyDetail(sym, doc, now)
+    } else if (root.detailSymbol === sym) {
+      root.detailFeed = null
+      root.detailFeedSymbol = sym
+      root.detailFeedError = (root.detailExitCode === 124)
+        ? "detail feed timed out"
+        : (root.detailExitCode === 126 || root.detailExitCode === 127)
+        ? "detail script not found"
+        : (root.detailCaptured.trim() === "" ? "detail feed produced no output"
+                                            : "detail feed returned unreadable data")
+    }
+    if (root.detailRequestQueued) {
+      root.detailRequestQueued = false
+      Qt.callLater(function() { root.requestDetail(true) })
+    }
+  }
+
+  // Pointing at a row starts its feed early. The request is slow (one round
+  // trip through whatever proxy this machine sits behind) and the cache is
+  // shared, so this is the difference between "click and wait" and "click and
+  // read". Nothing is queued: a busy prefetch is simply skipped, and a run
+  // that lands for a row the user did not pick only fills the cache.
+  property string hoverSymbol: ""
+  Timer {
+    id: hoverPrefetch
+    interval: 280
+    repeat: false
+    onTriggered: root.prefetchDetail(root.hoverSymbol)
+  }
+
+  function noteHover(r) {
+    var sym = (r && r.symbol !== undefined && r.symbol !== null) ? String(r.symbol) : ""
+    if (sym === "" || sym === root.detailSymbol) return
+    if (root.detailCache[sym] || root.detailFeedBusy) return
+    root.hoverSymbol = sym
+    hoverPrefetch.restart()
+  }
+
+  function prefetchDetail(sym) {
+    if (sym === "" || sym === root.detailSymbol) return
+    if (!root.detailFeedSupported) return
+    if (root.detailCache[sym] || root.detailFeedBusy) return
+    root.startDetailRun(sym)
+  }
+
+  // A new asset loads its card; the panel's own refresh keeps it current.
+  onSelectedKeyChanged: {
+    if (selectedKey === "") {
+      detailFeed = null
+      detailFeedSymbol = ""
+      detailFeedError = ""
+      return
+    }
+    if (!detailFeedSupported) {
+      detailFeed = null
+      detailFeedSymbol = detailSymbol
+      detailFeedError = "no chart for this data source"
+      return
+    }
+    requestDetail(false)
+  }
+
+  onSnapshotChanged: {
+    if (selectedKey !== "") requestDetail(false)
   }
 
   // `groupClosed` suppresses the per-row closed marker when the whole section
@@ -264,6 +696,25 @@ Panel {
     id: fm
     font.family: root.panelFont
     font.pixelSize: Style.font.body
+  }
+
+  // Detail card: the label column is measured over the fixed label set, so the
+  // values line up like the table's own columns.
+  FontMetrics {
+    id: detailLabelFm
+    font.family: root.panelFont
+    font.pixelSize: Style.font.body
+  }
+
+  readonly property real detailLabelW: {
+    void detailLabelFm.font.pixelSize // re-measure when the font scale changes
+    var labels = ["Price", "Day change", "Prev close", "Open", "Day range", "52w range",
+                  "Amplitude", "Market", "Data", "P/E", "EPS", "Volume", "10d avg vol",
+                  "Beta", "Div yield", "Shares out", "Exchange", "Name"]
+    var w = 0
+    for (var i = 0; i < labels.length; i++)
+      w = Math.max(w, detailLabelFm.advanceWidth(labels[i]))
+    return Math.ceil(w) + Style.space(8)
   }
 
   // ---- Currency per group: most groups are single-currency, so the code
@@ -541,6 +992,29 @@ Panel {
     return out
   }
 
+  // One entry per asset: the cells groupCells() produced for that row, so the
+  // renderer can draw a row as ONE item that owns hover and a click.
+  function groupRows(rows, groupClosed, groupMixed) {
+    var cells = groupCells(rows, groupClosed, groupMixed)
+    var cols = anyMixedCurrency ? 5 : 4
+    var out = []
+    for (var i = 0; i < rows.length; i++)
+      out.push({
+        row: rows[i],
+        cells: cells.slice(i * cols, i * cols + cols)
+      })
+    return out
+  }
+
+  // Same mapping the GridLayout expressed as Layout.preferredWidth.
+  function cellWidth(kind) {
+    if (kind === "label") return labelColW
+    if (kind === "cur") return curColW
+    if (kind === "price") return priceColW
+    if (kind === "chg") return chgColW
+    return noteColW
+  }
+
   // ---- Lifecycle: open/close/summon contract (same shape as weather).
   function open() {
     openedFromHotkey = false
@@ -561,6 +1035,8 @@ Panel {
   // Hide first: if the bar API ever rejects the setter again, the panel
   // still closes instead of stranding a full-screen overlay (tickerbar#1).
   function close() {
+    // Reopening starts on the watchlist, never on a card from the last visit.
+    root.selectedKey = ""
     root.controller.hide()
     setCenterHoverRevealSuppressed(false)
   }
@@ -812,6 +1288,48 @@ Panel {
     }
   }
 
+  // ---- Second, independent process for the detail feed. A slow or dead CNBC
+  //      must never stall the price table, so this shares nothing with
+  //      statusProc beyond this panel's own properties. Exit and collector are
+  //      joined the same way (either order), with the same failed-start belt.
+  Process {
+    id: detailProc
+    onRunningChanged: {
+      if (running) return
+      root.detailProcessDone = true
+      detailFallback.restart()
+      root.maybeApplyDetail()
+    }
+    onExited: function(code) {
+      root.detailExitCode = code
+      root.detailProcessDone = true
+      detailFallback.restart()
+      root.maybeApplyDetail()
+    }
+    stdout: StdioCollector {
+      waitForEnd: true
+      // Same tripwire idea as the price run: a document this script can
+      // produce is a few kilobytes, so anything near the cap is refused
+      // rather than parsed into the long-lived shell process.
+      readonly property int maxChars: 512 * 1024
+      onStreamFinished: {
+        root.detailCaptured = text.length > maxChars ? "" : text
+        root.detailCollectorDone = true
+        root.maybeApplyDetail()
+      }
+    }
+  }
+
+  Timer {
+    id: detailFallback
+    interval: 400
+    repeat: false
+    onTriggered: {
+      root.detailCollectorDone = true // give up on the collector
+      root.maybeApplyDetail()
+    }
+  }
+
   Timer {
     interval: root.refreshSeconds * 1000
     running: true
@@ -838,7 +1356,9 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      onCloseRequested: root.close()
+      // Escape steps out of the detail card first, then closes the panel —
+      // the same "back, then out" order the card's own arrow uses.
+      onCloseRequested: root.selectedKey !== "" ? root.clearDetail() : root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
       // No scrolling: like the waybar tooltip, long watchlists wrap into
@@ -919,7 +1439,7 @@ Panel {
         //      portfolio return, and printing it large would promise a
         //      precision it does not have.
         PanelHero {
-          visible: root.snapshot !== null
+          visible: root.snapshot !== null && root.selectedRow === null
           width: root.tableW
           title: "Watchlist"
           meta: root.heroMeta
@@ -986,6 +1506,399 @@ Panel {
           foreground: root.panelFg
         }
 
+        // ---- Detail card: one asset, opened by clicking its table row.
+        //      Every number here is already in the row the table holds, so the
+        //      card refreshes with the panel and costs no extra request. The
+        //      back arrow (or Escape) returns to the watchlist.
+        Column {
+          id: detailColumn
+          visible: root.selectedRow !== null
+          width: root.tableW
+          spacing: Style.space(14)
+
+          PanelHero {
+            width: root.tableW
+            title: root.selectedRow ? String(root.selectedRow.label) : ""
+            // The cap rides in the hero's pill: it is the one fundamental an
+            // investor looks for before anything else, and a row in the table
+            // below would bury it among P/E and beta.
+            detail: root.detailMarketCapText
+            meta: root.detailMeta
+            foreground: root.panelFg
+            fontFamily: root.panelFont
+
+            iconComponent: Component {
+              Text {
+                text: root.detailGlyph
+                textFormat: Text.PlainText
+                color: root.panelAccent
+                font.family: root.panelFont
+                font.pixelSize: Style.font.display
+              }
+            }
+
+            trailingControl: Component {
+              Row {
+                spacing: Style.space(4)
+
+                PanelActionButton {
+                  iconText: "󰏌" // nf-md-open_in_new
+                  tooltipText: "Open quote page"
+                  foreground: root.mutedFg
+                  hoverColor: root.panelFg
+                  fontFamily: root.panelFont
+                  fontSize: Style.font.icon
+                  onClicked: root.openQuote()
+                }
+
+                PanelActionButton {
+                  // nf-md-content_copy / nf-md-check
+                  iconText: root.symbolCopied ? "󰄬" : "󰆏"
+                  tooltipText: root.symbolCopied ? "Copied" : "Copy symbol"
+                  foreground: root.mutedFg
+                  hoverColor: root.panelFg
+                  fontFamily: root.panelFont
+                  fontSize: Style.font.icon
+                  enabled: root.detailSymbol !== ""
+                  onClicked: root.copySymbol()
+                }
+
+                PanelActionButton {
+                  iconText: "󰅁" // nf-md-chevron_left
+                  tooltipText: "Back to watchlist"
+                  foreground: root.mutedFg
+                  hoverColor: root.panelFg
+                  fontFamily: root.panelFont
+                  fontSize: Style.font.icon
+                  onClicked: root.clearDetail()
+                }
+              }
+            }
+          }
+
+          // Headline: the price the row carries, with the day's move beside it
+          // — the two numbers the table already ranks by.
+          Row {
+            spacing: Style.space(14)
+
+            Text {
+              id: detailPrice
+              textFormat: Text.PlainText
+              text: root.detailPriceText + root.detailCurrency
+              color: root.panelFg
+              font.family: root.panelFont
+              font.pixelSize: Style.font.display
+              font.bold: true
+              renderType: Text.NativeRendering
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              text: root.detailChangeText
+              anchors.baseline: detailPrice.baseline
+              color: root.detailDirColor
+              font.family: root.panelFont
+              font.pixelSize: Style.font.title
+              font.bold: true
+              renderType: Text.NativeRendering
+            }
+          }
+
+          // Day range: the low and high the row carries, with the price marked
+          // where it sits between them. Hidden when no range came back.
+          Column {
+            visible: root.detailRangePos >= 0
+            width: root.tableW
+            spacing: Style.space(5)
+
+            Item {
+              width: parent.width
+              height: Style.space(12)
+
+              Rectangle {
+                id: rangeTrack
+                anchors.verticalCenter: parent.verticalCenter
+                width: parent.width
+                height: Style.space(3)
+                radius: height / 2
+                color: Util.alpha(root.panelFg, 0.14)
+              }
+
+              Rectangle {
+                width: Style.space(6)
+                height: Style.space(10)
+                radius: width / 2
+                x: Math.round((rangeTrack.width - width) * root.detailRangePos)
+                anchors.verticalCenter: parent.verticalCenter
+                color: root.detailDirColor
+              }
+            }
+
+            Row {
+              spacing: Style.space(10)
+
+              Text {
+                textFormat: Text.PlainText
+                text: root.selectedRow && root.selectedRow.day_low !== null && root.selectedRow.day_low !== undefined
+                  ? root.fmtNumber(root.selectedRow.day_low) : "—"
+                color: root.mutedFg
+                font.family: root.panelFont
+                font.pixelSize: Style.font.caption
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                text: "low – high"
+                color: root.mutedFg
+                font.family: root.panelFont
+                font.pixelSize: Style.font.caption
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                text: root.selectedRow && root.selectedRow.day_high !== null && root.selectedRow.day_high !== undefined
+                  ? root.fmtNumber(root.selectedRow.day_high) : "—"
+                color: root.mutedFg
+                font.family: root.panelFont
+                font.pixelSize: Style.font.caption
+              }
+            }
+          }
+
+          // ---- Chart: OHLC candles from the detail feed. The three pills ask
+          //      the SAME document for another range, so switching costs no
+          //      request — the script returns 1D, 1W and 1Y together.
+          Column {
+            width: root.tableW
+            spacing: Style.space(8)
+
+            Row {
+              spacing: Style.space(4)
+
+              Repeater {
+                model: ["1D", "1W", "1Y"]
+
+                Rectangle {
+                  id: rangePill
+                  required property string modelData
+                  readonly property bool active: root.detailRange === modelData
+
+                  width: rangeLabel.implicitWidth + Style.space(16)
+                  height: rangeLabel.implicitHeight + Style.space(5)
+                  radius: height / 2
+                  color: active ? Util.alpha(root.panelAccent, 0.16) : "transparent"
+                  border.width: 1
+                  border.color: active ? Util.alpha(root.panelAccent, 0.45) : Util.alpha(root.panelFg, 0.12)
+
+                  Text {
+                    id: rangeLabel
+                    textFormat: Text.PlainText
+                    anchors.centerIn: parent
+                    text: rangePill.modelData
+                    color: rangePill.active ? root.panelFg : root.mutedFg
+                    font.family: root.panelFont
+                    font.pixelSize: Style.font.caption
+                    font.bold: rangePill.active
+                  }
+
+                  MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.detailRange = rangePill.modelData
+                  }
+                }
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                visible: root.detailChartStatus !== ""
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.detailChartStatus
+                color: root.mutedFg
+                font.family: root.panelFont
+                font.pixelSize: Style.font.caption
+              }
+            }
+
+            Item {
+              width: root.tableW
+              height: Style.space(132)
+
+              Canvas {
+                id: candleChart
+                anchors.fill: parent
+
+                property var candles: root.detailCandles
+                property var bounds: root.detailBounds
+                // Right band reserved for the two scale labels, so a candle
+                // can never be drawn under a number.
+                property real labelInset: Style.space(54)
+
+                onCandlesChanged: requestPaint()
+                onBoundsChanged: requestPaint()
+                onWidthChanged: requestPaint()
+                onHeightChanged: requestPaint()
+
+                onPaint: {
+                  var ctx = getContext("2d")
+                  ctx.clearRect(0, 0, width, height)
+
+                  var data = candleChart.candles
+                  var plotW = width - candleChart.labelInset
+                  var padY = Style.space(6)
+                  var plotH = height - padY * 2
+                  if (!data || data.length === 0 || plotW <= 0 || plotH <= 0) return
+
+                  var hi = candleChart.bounds.hi
+                  var lo = candleChart.bounds.lo
+                  if (!isFinite(hi) || !isFinite(lo)) return
+                  if (hi === lo) { hi += 0.01; lo -= 0.01 }
+                  var pad = (hi - lo) * 0.06
+                  hi += pad
+                  lo -= pad
+                  var span = hi - lo
+
+                  // Three hairlines: the top and bottom ones are the scale.
+                  ctx.lineWidth = 1
+                  ctx.strokeStyle = Util.alpha(root.panelFg, 0.08)
+                  for (var g = 0; g <= 2; g++) {
+                    var gy = Math.round(padY + plotH * (g / 2)) + 0.5
+                    ctx.beginPath()
+                    ctx.moveTo(0, gy)
+                    ctx.lineTo(plotW, gy)
+                    ctx.stroke()
+                  }
+
+                  var step = plotW / data.length
+                  var bodyW = Math.max(1, Math.min(Style.space(9), step * 0.62))
+                  var upColor = root.panelDirColor("up")
+                  var downColor = root.panelDirColor("down")
+
+                  for (var k = 0; k < data.length; k++) {
+                    var c = data[k]
+                    var cx = Math.round((k + 0.5) * step) + 0.5
+                    var rising = Number(c.c) >= Number(c.o)
+                    ctx.strokeStyle = rising ? upColor : downColor
+                    ctx.fillStyle = rising ? upColor : downColor
+                    ctx.lineWidth = Math.max(1, Math.min(2, step * 0.18))
+
+                    var yHigh = padY + plotH * (1 - (Number(c.h) - lo) / span)
+                    var yLow = padY + plotH * (1 - (Number(c.l) - lo) / span)
+                    ctx.beginPath()
+                    ctx.moveTo(cx, yHigh)
+                    ctx.lineTo(cx, yLow)
+                    ctx.stroke()
+
+                    var yOpen = padY + plotH * (1 - (Number(c.o) - lo) / span)
+                    var yClose = padY + plotH * (1 - (Number(c.c) - lo) / span)
+                    var top = Math.min(yOpen, yClose)
+                    var bodyH = Math.max(1, Math.abs(yClose - yOpen))
+                    ctx.fillRect(cx - bodyW / 2, top, bodyW, bodyH)
+                  }
+                }
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                anchors.right: parent.right
+                anchors.top: parent.top
+                anchors.topMargin: Style.space(1)
+                visible: root.detailCandles.length > 0 && isFinite(root.detailBounds.hi)
+                text: isFinite(root.detailBounds.hi) ? root.fmtNumber(root.detailBounds.hi) : ""
+                color: root.mutedFg
+                font.family: root.panelFont
+                font.pixelSize: Style.font.caption
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: Style.space(1)
+                visible: root.detailCandles.length > 0 && isFinite(root.detailBounds.lo)
+                text: isFinite(root.detailBounds.lo) ? root.fmtNumber(root.detailBounds.lo) : ""
+                color: root.mutedFg
+                font.family: root.panelFont
+                font.pixelSize: Style.font.caption
+              }
+            }
+          }
+
+          // Key/value block: session facts on the left, fundamentals on the
+          // right. Two columns keep the card shorter than the table it
+          // replaces instead of growing into a screen-tall list.
+          Row {
+            width: root.tableW
+            spacing: Style.space(28)
+
+            Column {
+              spacing: Style.space(5)
+
+              Repeater {
+                model: root.detailRows
+
+                Row {
+                  required property var modelData
+                  spacing: Style.space(12)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: modelData.label
+                    width: root.detailLabelW
+                    color: root.mutedFg
+                    font.family: root.panelFont
+                    font.pixelSize: Style.font.body
+                    renderType: Text.NativeRendering
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: modelData.value
+                    color: modelData.dir ? root.panelDirColor(modelData.dir) : root.panelFg
+                    font.family: root.panelFont
+                    font.pixelSize: Style.font.body
+                    font.bold: modelData.strong === true
+                    renderType: Text.NativeRendering
+                  }
+                }
+              }
+            }
+
+            Column {
+              visible: root.detailRowsRight.length > 0
+              spacing: Style.space(5)
+
+              Repeater {
+                model: root.detailRowsRight
+
+                Row {
+                  required property var modelData
+                  spacing: Style.space(12)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: modelData.label
+                    width: root.detailLabelW
+                    color: root.mutedFg
+                    font.family: root.panelFont
+                    font.pixelSize: Style.font.body
+                    renderType: Text.NativeRendering
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: modelData.value
+                    color: root.panelFg
+                    font.family: root.panelFont
+                    font.pixelSize: Style.font.body
+                    renderType: Text.NativeRendering
+                  }
+                }
+              }
+            }
+          }
+        }
+
         // ---- Bands stacked vertically; inside a band, columns sit side by
         //      side; a column is a run of sections (header + aligned 4-column
         //      grid: label | price | change % | note). Every grid shares the
@@ -997,6 +1910,10 @@ Panel {
             id: bandBlock
             required property var modelData
             required property int index
+            // The detail card replaces the table; the bands collapse instead of
+            // being destroyed, so `bands`, `tableW` and the card width keep
+            // their values while a single asset is on screen.
+            visible: root.selectedRow === null
             spacing: Style.space(14)
 
             PanelSeparator {
@@ -1119,32 +2036,68 @@ Panel {
                           }
                         }
 
-                        GridLayout {
+                        // ---- Rows are items, not flattened GridLayout
+                        //      cells: each asset owns one line, so it can
+                        //      carry hover and a click. Column widths are the
+                        //      shared measured ones, so the grid still aligns
+                        //      with every other section; the 5px hover padding
+                        //      is given back by the text inset.
+                        Column {
                           x: root.rowIndent
-                          columns: root.anyMixedCurrency ? 5 : 4
-                          rowSpacing: Style.space(4)
-                          columnSpacing: Style.space(14)
+                          spacing: Style.space(4)
 
                           Repeater {
-                            model: root.groupCells(segBlock.modelData.rows || [], segBlock.modelData.closed, segBlock.modelData.mixedCurrency)
+                            model: root.groupRows(segBlock.modelData.rows || [], segBlock.modelData.closed, segBlock.modelData.mixedCurrency)
 
-                            Text {
+                            Rectangle {
+                              id: assetRow
                               required property var modelData
-                              text: modelData.text
-                              textFormat: Text.PlainText
-                              color: modelData.dim ? root.mutedFg
-                                : (modelData.kind === "label" ? root.panelFg : root.panelDirColor(modelData.dir))
-                              font.family: root.panelFont
-                              font.pixelSize: Style.font.body
-                              renderType: Text.NativeRendering
-                              horizontalAlignment: modelData.kind === "price" || modelData.kind === "chg"
-                                ? Text.AlignRight : Text.AlignLeft
-                              Layout.preferredWidth: modelData.kind === "label" ? root.labelColW
-                                : modelData.kind === "cur" ? root.curColW
-                                : modelData.kind === "price" ? root.priceColW
-                                : modelData.kind === "chg" ? root.chgColW : root.noteColW
-                              Layout.alignment: Qt.AlignVCenter
-                                | (modelData.kind === "price" || modelData.kind === "chg" ? Qt.AlignRight : Qt.AlignLeft)
+
+                              x: -Style.space(5)
+                              width: root.gridW + Style.space(10)
+                              height: rowLine.implicitHeight
+                              radius: Style.cornerRadius
+                              // Row height stays exactly the text line: the
+                              // panel's fit budget (rowUnitH) counts on it.
+                              color: rowMouse.containsMouse ? Util.alpha(root.panelFg, 0.07) : "transparent"
+
+                              Row {
+                                id: rowLine
+                                anchors.left: parent.left
+                                anchors.leftMargin: Style.space(5)
+                                anchors.verticalCenter: parent.verticalCenter
+                                spacing: Style.space(14)
+
+                                Repeater {
+                                  model: assetRow.modelData.cells
+
+                                  Text {
+                                    required property var modelData
+                                    text: modelData.text
+                                    textFormat: Text.PlainText
+                                    width: root.cellWidth(modelData.kind)
+                                    color: modelData.dim ? root.mutedFg
+                                      : (modelData.kind === "label" ? root.panelFg : root.panelDirColor(modelData.dir))
+                                    font.family: root.panelFont
+                                    font.pixelSize: Style.font.body
+                                    renderType: Text.NativeRendering
+                                    horizontalAlignment: modelData.kind === "price" || modelData.kind === "chg"
+                                      ? Text.AlignRight : Text.AlignLeft
+                                  }
+                                }
+                              }
+
+                              // Click = "show me this one". The pointer shape is
+                              // the only affordance: a hint glyph on every line
+                              // would cost a column of width.
+                              MouseArea {
+                                id: rowMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onEntered: root.noteHover(assetRow.modelData.row)
+                                onClicked: root.showDetail(assetRow.modelData.row)
+                              }
                             }
                           }
                         }

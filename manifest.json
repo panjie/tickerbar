@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "Tickerbar",
-    "description": "Click: market table. Middle click: refresh.",
+    "description": "Click: market table. Click a row: that asset's detail card. Middle click: refresh.",
     "category": "Status",
     "allowMultiple": false,
     "defaultSection": "right",
