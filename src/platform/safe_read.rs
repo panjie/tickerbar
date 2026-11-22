@@ -137,10 +137,7 @@ mod tests {
         let p = tmp("utf8").join("f");
         std::fs::write(&p, "ñ".repeat(50)).unwrap();
         let e = read_bounded(&p, 5).unwrap_err();
-        assert!(
-            e.to_string().contains("larger than 5 bytes"),
-            "got: {e}"
-        );
+        assert!(e.to_string().contains("larger than 5 bytes"), "got: {e}");
     }
 
     #[test]

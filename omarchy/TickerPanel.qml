@@ -560,6 +560,12 @@ Panel {
   }
 
   // A new asset loads its card; the panel's own refresh keeps it current.
+  // The gate must be read AFTER the derived bindings settle: QML runs this
+  // handler before detailSymbol/detailSource/detailFeedSupported have been
+  // re-evaluated, so a synchronous read described the PREVIOUS selection.
+  // Since back, Esc and close all reset selectedKey to "", every click is a
+  // ""→key jump, the stale read was always "no selection", and every cnbc
+  // row showed "no chart for this data source" even though its feed works.
   onSelectedKeyChanged: {
     if (selectedKey === "") {
       detailFeed = null
@@ -567,6 +573,11 @@ Panel {
       detailFeedError = ""
       return
     }
+    Qt.callLater(loadDetailForSelection)
+  }
+
+  function loadDetailForSelection() {
+    if (selectedKey === "") return
     if (!detailFeedSupported) {
       detailFeed = null
       detailFeedSymbol = detailSymbol

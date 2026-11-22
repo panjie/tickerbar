@@ -5,8 +5,14 @@ static PANEL: &str = include_str!("../omarchy/TickerPanel.qml");
 
 #[test]
 fn a_run_is_marked_not_installed_only_without_an_exit_signal() {
-    assert!(PANEL.contains("sawExit = false"), "startRun must reset sawExit");
-    assert!(PANEL.contains("root.sawExit = true"), "onExited must set sawExit");
+    assert!(
+        PANEL.contains("sawExit = false"),
+        "startRun must reset sawExit"
+    );
+    assert!(
+        PANEL.contains("root.sawExit = true"),
+        "onExited must set sawExit"
+    );
     assert!(
         PANEL.contains("} else if (!sawExit || exitCode === 126 || exitCode === 127) {"),
         "gate on !sawExit or sh's exec-failure codes"
@@ -44,6 +50,50 @@ fn the_install_command_is_one_constant_copied_as_argv() {
     assert!(
         PANEL.contains("visible: root.notInstalled"),
         "the button gates on notInstalled — topError also carries CLI errors"
+    );
+}
+
+// The QML engine emits onSelectedKeyChanged BEFORE the bindings derived from
+// selectedKey (detailSymbol/detailSource/detailFeedSupported) re-evaluate, so
+// a synchronous gate read inside the handler described the PREVIOUS selection.
+// Back, Esc and close all reset selectedKey to "", every click is a ""→key
+// jump, and the stale read was always "no selection" — cnbc rows showed
+// "no chart for this data source" even though their detail feed works.
+#[test]
+fn a_selection_defers_the_detail_gate_until_its_bindings_settle() {
+    let handler = PANEL
+        .split("onSelectedKeyChanged: {")
+        .nth(1)
+        .expect("onSelectedKeyChanged must exist")
+        .split("\n  }\n")
+        .next()
+        .unwrap();
+    assert!(
+        !handler.contains("detailFeedSupported"),
+        "the handler must not read the derived gate synchronously (stale at signal time)"
+    );
+    assert!(
+        handler.contains("Qt.callLater(loadDetailForSelection)"),
+        "the gate must run after the engine has re-evaluated the derived bindings"
+    );
+    let loader = PANEL
+        .split("function loadDetailForSelection() {")
+        .nth(1)
+        .expect("loadDetailForSelection must exist")
+        .split("\n  }\n")
+        .next()
+        .unwrap();
+    assert!(
+        loader.contains("if (selectedKey === \"\") return"),
+        "the deferred run still honors a selection cleared before it fires"
+    );
+    assert!(
+        loader.contains("detailFeedError = \"no chart for this data source\""),
+        "the unsupported-source message keeps its wording"
+    );
+    assert!(
+        loader.contains("requestDetail(false)"),
+        "a supported selection still loads its feed through the cached path"
     );
 }
 
